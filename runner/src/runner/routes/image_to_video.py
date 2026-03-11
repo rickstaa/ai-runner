@@ -1,9 +1,7 @@
 import logging
-import os
 import random
 from typing import Annotated, Dict, Tuple, Union
 
-import torch
 from fastapi import APIRouter, Depends, File, Form, UploadFile, status
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -12,9 +10,11 @@ from PIL import Image, ImageFile
 from runner.dependencies import get_pipeline
 from runner.pipelines.base import Pipeline
 from runner.routes.utils import (
-    HTTPError,
     VideoResponse,
-    handle_pipeline_exception,
+    RESPONSES,
+    check_auth_token,
+    check_model_id,
+    execute_pipeline,
     http_error,
     image_to_data_url,
 )
@@ -32,22 +32,6 @@ PIPELINE_ERROR_CONFIG: Dict[str, Tuple[Union[str, None], int]] = {
         "Out of memory error. Try reducing input or output video resolution.",
         status.HTTP_500_INTERNAL_SERVER_ERROR,
     )
-}
-
-
-RESPONSES = {
-    status.HTTP_200_OK: {
-        "content": {
-            "application/json": {
-                "schema": {
-                    "x-speakeasy-name-override": "data",
-                }
-            }
-        },
-    },
-    status.HTTP_400_BAD_REQUEST: {"model": HTTPError},
-    status.HTTP_401_UNAUTHORIZED: {"model": HTTPError},
-    status.HTTP_500_INTERNAL_SERVER_ERROR: {"model": HTTPError},
 }
 
 
@@ -126,23 +110,11 @@ async def image_to_video(
     pipeline: Pipeline = Depends(get_pipeline),
     token: HTTPAuthorizationCredentials = Depends(HTTPBearer(auto_error=False)),
 ):
-    auth_token = os.environ.get("AUTH_TOKEN")
-    if auth_token:
-        if not token or token.credentials != auth_token:
-            return JSONResponse(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                headers={"WWW-Authenticate": "Bearer"},
-                content=http_error("Invalid bearer token."),
-            )
+    if auth_error := check_auth_token(token):
+        return auth_error
 
-    if model_id != "" and model_id != pipeline.model_id:
-        return JSONResponse(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            content=http_error(
-                f"pipeline configured with {pipeline.model_id} but called with "
-                f"{model_id}."
-            ),
-        )
+    if model_error := check_model_id(model_id, pipeline.model_id):
+        return model_error
 
     if height % 8 != 0 or width % 8 != 0:
         return JSONResponse(
@@ -156,28 +128,24 @@ async def image_to_video(
     if seed is None:
         seed = random.randint(0, 2**32 - 1)
 
-    try:
-        batch_frames, has_nsfw_concept = pipeline(
-            image=Image.open(image.file).convert("RGB"),
-            height=height,
-            width=width,
-            fps=fps,
-            motion_bucket_id=motion_bucket_id,
-            noise_aug_strength=noise_aug_strength,
-            num_inference_steps=num_inference_steps,
-            safety_check=safety_check,
-            seed=seed,
-        )
-    except Exception as e:
-        if isinstance(e, torch.cuda.OutOfMemoryError):
-            # TODO: Investigate why not all VRAM memory is cleared.
-            torch.cuda.empty_cache()
-        logger.error(f"ImageToVideo pipeline error: {e}")
-        return handle_pipeline_exception(
-            e,
-            default_error_message="Image-to-video pipeline error.",
-            custom_error_config=PIPELINE_ERROR_CONFIG,
-        )
+    result, error = execute_pipeline(
+        pipeline,
+        default_error_message="Image-to-video pipeline error.",
+        custom_error_config=PIPELINE_ERROR_CONFIG,
+        image=Image.open(image.file).convert("RGB"),
+        height=height,
+        width=width,
+        fps=fps,
+        motion_bucket_id=motion_bucket_id,
+        noise_aug_strength=noise_aug_strength,
+        num_inference_steps=num_inference_steps,
+        safety_check=safety_check,
+        seed=seed,
+    )
+    if error:
+        return error
+
+    batch_frames, has_nsfw_concept = result
 
     output_frames = []
     for frames in batch_frames:

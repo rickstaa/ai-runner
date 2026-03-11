@@ -1,9 +1,7 @@
 import logging
-import os
 import random
 from typing import Annotated, Dict, Tuple, Union
 
-import torch
 from fastapi import APIRouter, Depends, status
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -12,9 +10,11 @@ from pydantic import BaseModel, Field
 from runner.dependencies import get_pipeline
 from runner.pipelines.base import Pipeline
 from runner.routes.utils import (
-    HTTPError,
     ImageResponse,
-    handle_pipeline_exception,
+    RESPONSES,
+    check_auth_token,
+    check_model_id,
+    execute_pipeline,
     http_error,
     image_to_data_url,
 )
@@ -120,22 +120,6 @@ class TextToImageParams(BaseModel):
     ]
 
 
-RESPONSES = {
-    status.HTTP_200_OK: {
-        "content": {
-            "application/json": {
-                "schema": {
-                    "x-speakeasy-name-override": "data",
-                }
-            }
-        },
-    },
-    status.HTTP_400_BAD_REQUEST: {"model": HTTPError},
-    status.HTTP_401_UNAUTHORIZED: {"model": HTTPError},
-    status.HTTP_500_INTERNAL_SERVER_ERROR: {"model": HTTPError},
-}
-
-
 @router.post(
     "/text-to-image",
     response_model=ImageResponse,
@@ -166,23 +150,11 @@ async def text_to_image(
             content=http_error("Prompt must be provided."),
         )
 
-    auth_token = os.environ.get("AUTH_TOKEN")
-    if auth_token:
-        if not token or token.credentials != auth_token:
-            return JSONResponse(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                headers={"WWW-Authenticate": "Bearer"},
-                content=http_error("Invalid bearer token."),
-            )
+    if auth_error := check_auth_token(token):
+        return auth_error
 
-    if params.model_id != "" and params.model_id != pipeline.model_id:
-        return JSONResponse(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            content=http_error(
-                f"pipeline configured with {pipeline.model_id} but called with "
-                f"{params.model_id}."
-            ),
-        )
+    if model_error := check_model_id(params.model_id, pipeline.model_id):
+        return model_error
 
     seed = params.seed if params.seed is not None else random.randint(0, 2**32 - 1)
     seeds = [seed + i for i in range(params.num_images_per_prompt)]
@@ -195,18 +167,15 @@ async def text_to_image(
     for seed in seeds:
         params.seed = seed
         kwargs = {k: v for k, v in params.model_dump().items() if k != "model_id"}
-        try:
-            imgs, nsfw_check = pipeline(**kwargs)
-        except Exception as e:
-            if isinstance(e, torch.cuda.OutOfMemoryError):
-                # TODO: Investigate why not all VRAM memory is cleared.
-                torch.cuda.empty_cache()
-            logger.error(f"TextToImage pipeline error: {e}")
-            return handle_pipeline_exception(
-                e,
-                default_error_message="Text-to-image pipeline error.",
-                custom_error_config=PIPELINE_ERROR_CONFIG,
-            )
+        result, error = execute_pipeline(
+            pipeline,
+            default_error_message="Text-to-image pipeline error.",
+            custom_error_config=PIPELINE_ERROR_CONFIG,
+            **kwargs,
+        )
+        if error:
+            return error
+        imgs, nsfw_check = result
         images.extend(imgs)
         has_nsfw_concept.extend(nsfw_check)
 

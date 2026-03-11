@@ -1,9 +1,7 @@
 import logging
-import os
 import time
 from typing import Annotated, Dict, Tuple, Union
 
-import torch
 from fastapi import APIRouter, Depends, status
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -13,9 +11,11 @@ from runner.dependencies import get_pipeline
 from runner.pipelines.base import Pipeline
 from runner.routes.utils import (
     AudioResponse,
-    HTTPError,
+    RESPONSES,
+    check_auth_token,
+    check_model_id,
+    execute_pipeline,
     audio_to_data_url,
-    handle_pipeline_exception,
     http_error,
 )
 
@@ -58,22 +58,6 @@ class TextToSpeechParams(BaseModel):
     ]
 
 
-RESPONSES = {
-    status.HTTP_200_OK: {
-        "content": {
-            "application/json": {
-                "schema": {
-                    "x-speakeasy-name-override": "data",
-                }
-            }
-        },
-    },
-    status.HTTP_400_BAD_REQUEST: {"model": HTTPError},
-    status.HTTP_401_UNAUTHORIZED: {"model": HTTPError},
-    status.HTTP_500_INTERNAL_SERVER_ERROR: {"model": HTTPError},
-}
-
-
 @router.post(
     "/text-to-speech",
     response_model=AudioResponse,
@@ -107,37 +91,21 @@ async def text_to_speech(
             content=http_error("Text input must be provided."),
         )
 
-    auth_token = os.environ.get("AUTH_TOKEN")
-    if auth_token:
-        if not token or token.credentials != auth_token:
-            return JSONResponse(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                headers={"WWW-Authenticate": "Bearer"},
-                content=http_error("Invalid bearer token."),
-            )
+    if auth_error := check_auth_token(token):
+        return auth_error
 
-    if params.model_id != "" and params.model_id != pipeline.model_id:
-        return JSONResponse(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            content=http_error(
-                f"pipeline configured with {pipeline.model_id} but called with "
-                f"{params.model_id}"
-            ),
-        )
+    if model_error := check_model_id(params.model_id, pipeline.model_id):
+        return model_error
 
-    try:
-        start = time.time()
-        out = pipeline(params)
-        logger.info(f"TextToSpeechPipeline took {time.time() - start} seconds.")
-    except Exception as e:
-        if isinstance(e, torch.cuda.OutOfMemoryError):
-            # TODO: Investigate why not all VRAM memory is cleared.
-            torch.cuda.empty_cache()
-        logger.error(f"TextToSpeechPipeline error: {e}")
-        return handle_pipeline_exception(
-            e,
-            default_error_message="Text-to-speech pipeline error.",
-            custom_error_config=PIPELINE_ERROR_CONFIG,
-        )
+    start = time.time()
+    result, error = execute_pipeline(
+        pipeline,
+        default_error_message="Text-to-speech pipeline error.",
+        custom_error_config=PIPELINE_ERROR_CONFIG,
+        params=params,
+    )
+    if error:
+        return error
+    logger.info(f"TextToSpeechPipeline took {time.time() - start} seconds.")
 
-    return {"audio": {"url": audio_to_data_url(out)}}
+    return {"audio": {"url": audio_to_data_url(result)}}

@@ -1,21 +1,19 @@
 import logging
-import os
 import random
 from typing import Annotated, Dict, Tuple, Union
 
-import torch
 from fastapi import APIRouter, Depends, File, Form, UploadFile, status
-from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from PIL import Image, ImageFile
 
 from runner.dependencies import get_pipeline
 from runner.pipelines.base import Pipeline
 from runner.routes.utils import (
-    HTTPError,
     ImageResponse,
-    handle_pipeline_exception,
-    http_error,
+    RESPONSES,
+    check_auth_token,
+    check_model_id,
+    execute_pipeline,
     image_to_data_url,
 )
 
@@ -33,21 +31,6 @@ PIPELINE_ERROR_CONFIG: Dict[str, Tuple[Union[str, None], int]] = {
         "Out of memory error. Try reducing input image resolution.",
         status.HTTP_500_INTERNAL_SERVER_ERROR,
     )
-}
-
-RESPONSES = {
-    status.HTTP_200_OK: {
-        "content": {
-            "application/json": {
-                "schema": {
-                    "x-speakeasy-name-override": "data",
-                }
-            }
-        },
-    },
-    status.HTTP_400_BAD_REQUEST: {"model": HTTPError},
-    status.HTTP_401_UNAUTHORIZED: {"model": HTTPError},
-    status.HTTP_500_INTERNAL_SERVER_ERROR: {"model": HTTPError},
 }
 
 
@@ -153,23 +136,11 @@ async def image_to_image(
     pipeline: Pipeline = Depends(get_pipeline),
     token: HTTPAuthorizationCredentials = Depends(HTTPBearer(auto_error=False)),
 ):
-    auth_token = os.environ.get("AUTH_TOKEN")
-    if auth_token:
-        if not token or token.credentials != auth_token:
-            return JSONResponse(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                headers={"WWW-Authenticate": "Bearer"},
-                content=http_error("Invalid bearer token."),
-            )
+    if auth_error := check_auth_token(token):
+        return auth_error
 
-    if model_id != "" and model_id != pipeline.model_id:
-        return JSONResponse(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            content=http_error(
-                f"pipeline configured with {pipeline.model_id} but called with "
-                f"{model_id}."
-            ),
-        )
+    if model_error := check_model_id(model_id, pipeline.model_id):
+        return model_error
 
     seed = seed if seed is not None else random.randint(0, 2**32 - 1)
     seeds = [seed + i for i in range(num_images_per_prompt)]
@@ -181,30 +152,25 @@ async def image_to_image(
     images = []
     has_nsfw_concept = []
     for seed in seeds:
-        try:
-            imgs, nsfw_checks = pipeline(
-                prompt=prompt,
-                image=image,
-                strength=strength,
-                loras=loras,
-                guidance_scale=guidance_scale,
-                image_guidance_scale=image_guidance_scale,
-                negative_prompt=negative_prompt,
-                safety_check=safety_check,
-                seed=seed,
-                num_images_per_prompt=1,
-                num_inference_steps=num_inference_steps,
-            )
-        except Exception as e:
-            if isinstance(e, torch.cuda.OutOfMemoryError):
-                # TODO: Investigate why not all VRAM memory is cleared.
-                torch.cuda.empty_cache()
-            logger.error(f"ImageToImagePipeline pipeline error: {e}")
-            return handle_pipeline_exception(
-                e,
-                default_error_message="Image-to-image pipeline error.",
-                custom_error_config=PIPELINE_ERROR_CONFIG,
-            )
+        result, error = execute_pipeline(
+            pipeline,
+            default_error_message="Image-to-image pipeline error.",
+            custom_error_config=PIPELINE_ERROR_CONFIG,
+            prompt=prompt,
+            image=image,
+            strength=strength,
+            loras=loras,
+            guidance_scale=guidance_scale,
+            image_guidance_scale=image_guidance_scale,
+            negative_prompt=negative_prompt,
+            safety_check=safety_check,
+            seed=seed,
+            num_images_per_prompt=1,
+            num_inference_steps=num_inference_steps,
+        )
+        if error:
+            return error
+        imgs, nsfw_checks = result
         images.extend(imgs)
         has_nsfw_concept.extend(nsfw_checks)
 

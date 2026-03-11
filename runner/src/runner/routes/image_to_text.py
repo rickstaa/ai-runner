@@ -1,8 +1,6 @@
 import logging
-import os
 from typing import Annotated, Dict, Tuple, Union
 
-import torch
 from fastapi import APIRouter, Depends, File, Form, UploadFile, status
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -13,8 +11,11 @@ from runner.pipelines.base import Pipeline
 from runner.routes.utils import (
     HTTPError,
     ImageToTextResponse,
+    RESPONSES,
+    check_auth_token,
+    check_model_id,
+    execute_pipeline,
     file_exceeds_max_size,
-    handle_pipeline_exception,
     http_error,
 )
 
@@ -31,27 +32,17 @@ PIPELINE_ERROR_CONFIG: Dict[str, Tuple[Union[str, None], int]] = {
     )
 }
 
-RESPONSES = {
-    status.HTTP_200_OK: {
-        "content": {
-            "application/json": {
-                "schema": {
-                    "x-speakeasy-name-override": "data",
-                }
-            }
-        },
-    },
-    status.HTTP_400_BAD_REQUEST: {"model": HTTPError},
-    status.HTTP_401_UNAUTHORIZED: {"model": HTTPError},
+# Extend shared RESPONSES with additional status codes for this route.
+IMAGE_TO_TEXT_RESPONSES = {
+    **RESPONSES,
     status.HTTP_413_REQUEST_ENTITY_TOO_LARGE: {"model": HTTPError},
-    status.HTTP_500_INTERNAL_SERVER_ERROR: {"model": HTTPError},
 }
 
 
 @router.post(
     "/image-to-text",
     response_model=ImageToTextResponse,
-    responses=RESPONSES,
+    responses=IMAGE_TO_TEXT_RESPONSES,
     description="Transform image files to text.",
     operation_id="genImageToText",
     summary="Image To Text",
@@ -61,7 +52,7 @@ RESPONSES = {
 @router.post(
     "/image-to-text/",
     response_model=ImageToTextResponse,
-    responses=RESPONSES,
+    responses=IMAGE_TO_TEXT_RESPONSES,
     include_in_schema=False,
 )
 async def image_to_text(
@@ -79,23 +70,11 @@ async def image_to_text(
     pipeline: Pipeline = Depends(get_pipeline),
     token: HTTPAuthorizationCredentials = Depends(HTTPBearer(auto_error=False)),
 ):
-    auth_token = os.environ.get("AUTH_TOKEN")
-    if auth_token:
-        if not token or token.credentials != auth_token:
-            return JSONResponse(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                headers={"WWW-Authenticate": "Bearer"},
-                content=http_error("Invalid bearer token"),
-            )
+    if auth_error := check_auth_token(token):
+        return auth_error
 
-    if model_id != "" and model_id != pipeline.model_id:
-        return JSONResponse(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            content=http_error(
-                f"pipeline configured with {pipeline.model_id} but called with "
-                f"{model_id}"
-            ),
-        )
+    if model_error := check_model_id(model_id, pipeline.model_id):
+        return model_error
 
     if file_exceeds_max_size(image, 50 * 1024 * 1024):
         return JSONResponse(
@@ -104,15 +83,13 @@ async def image_to_text(
         )
 
     image = Image.open(image.file).convert("RGB")
-    try:
-        return ImageToTextResponse(text=pipeline(prompt=prompt, image=image))
-    except Exception as e:
-        if isinstance(e, torch.cuda.OutOfMemoryError):
-            # TODO: Investigate why not all VRAM memory is cleared.
-            torch.cuda.empty_cache()
-        logger.error(f"ImageToTextPipeline error: {e}")
-        return handle_pipeline_exception(
-            e,
-            default_error_message="Image-to-text pipeline error.",
-            custom_error_config=PIPELINE_ERROR_CONFIG,
-        )
+    result, error = execute_pipeline(
+        pipeline,
+        default_error_message="Image-to-text pipeline error.",
+        custom_error_config=PIPELINE_ERROR_CONFIG,
+        prompt=prompt,
+        image=image,
+    )
+    if error:
+        return error
+    return ImageToTextResponse(text=result)

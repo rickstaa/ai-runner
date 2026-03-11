@@ -1,21 +1,23 @@
 import logging
-import os
+import traceback
 from typing import Annotated, Any, Dict, Tuple, Union
 
 import torch
-import traceback
-from runner.dependencies import get_pipeline
-from runner.pipelines.base import Pipeline
-from runner.routes.utils import (
-    HTTPError,
-    LiveVideoToVideoResponse,
-    http_error,
-    handle_pipeline_exception,
-)
-from fastapi import APIRouter, Depends, status, Header
+from fastapi import APIRouter, Depends, status
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
+
+from runner.dependencies import get_pipeline
+from runner.pipelines.base import Pipeline
+from runner.routes.utils import (
+    LiveVideoToVideoResponse,
+    RESPONSES,
+    check_auth_token,
+    check_model_id,
+    handle_pipeline_exception,
+    http_error,
+)
 
 router = APIRouter()
 
@@ -94,21 +96,6 @@ class LiveVideoToVideoParams(BaseModel):
         ),
     ]
 
-RESPONSES: dict[int | str, dict[str, Any]]= {
-    status.HTTP_200_OK: {
-        "content": {
-            "application/json": {
-                "schema": {
-                    "x-speakeasy-name-override": "data",
-                }
-            }
-        },
-    },
-    status.HTTP_400_BAD_REQUEST: {"model": HTTPError},
-    status.HTTP_401_UNAUTHORIZED: {"model": HTTPError},
-    status.HTTP_500_INTERNAL_SERVER_ERROR: {"model": HTTPError},
-}
-
 @router.post(
     "/live-video-to-video",
     response_model=LiveVideoToVideoResponse,
@@ -130,23 +117,11 @@ async def live_video_to_video(
     pipeline: Pipeline = Depends(get_pipeline),
     token: HTTPAuthorizationCredentials = Depends(HTTPBearer(auto_error=False)),
 ):
-    auth_token = os.environ.get("AUTH_TOKEN")
-    if auth_token:
-        if not token or token.credentials != auth_token:
-            return JSONResponse(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                headers={"WWW-Authenticate": "Bearer"},
-                content=http_error("Invalid bearer token."),
-            )
+    if auth_error := check_auth_token(token):
+        return auth_error
 
-    if params.model_id != "" and params.model_id != pipeline.model_id:
-        return JSONResponse(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            content=http_error(
-                f"pipeline configured with {pipeline.model_id} but called with "
-                f"{params.model_id}."
-            ),
-        )
+    if model_error := check_model_id(params.model_id, pipeline.model_id):
+        return model_error
 
     try:
         pipeline(**params.model_dump(), request_id=params.gateway_request_id)
@@ -163,4 +138,3 @@ async def live_video_to_video(
 
     # outputs unused for now; the orchestrator is setting these
     return {'publish_url':"", 'subscribe_url': "", 'control_url': ""}
-

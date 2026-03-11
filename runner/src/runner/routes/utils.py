@@ -1,16 +1,21 @@
 import base64
 import io
 import json
+import logging
 import os
 import subprocess
 import tempfile
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
+import torch
 from fastapi import UploadFile, status
 from fastapi.responses import JSONResponse
+from fastapi.security import HTTPAuthorizationCredentials
 from PIL import Image
 from pydantic import BaseModel, Field
+
+logger = logging.getLogger(__name__)
 
 
 class MediaURL(BaseModel):
@@ -397,3 +402,83 @@ def get_media_duration_ffmpeg(bytes: bytes) -> float:
         os.remove(temp_file_path)
 
     return duration
+
+
+# Shared response definitions for route handlers.
+RESPONSES = {
+    status.HTTP_200_OK: {
+        "content": {
+            "application/json": {
+                "schema": {
+                    "x-speakeasy-name-override": "data",
+                }
+            }
+        },
+    },
+    status.HTTP_400_BAD_REQUEST: {"model": HTTPError},
+    status.HTTP_401_UNAUTHORIZED: {"model": HTTPError},
+    status.HTTP_500_INTERNAL_SERVER_ERROR: {"model": HTTPError},
+}
+
+
+def check_auth_token(
+    token: HTTPAuthorizationCredentials | None,
+) -> JSONResponse | None:
+    """Validate the bearer token against AUTH_TOKEN env var.
+
+    Returns a 401 JSONResponse if invalid, or None if auth passes.
+    """
+    auth_token = os.environ.get("AUTH_TOKEN")
+    if auth_token:
+        if not token or token.credentials != auth_token:
+            return JSONResponse(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                headers={"WWW-Authenticate": "Bearer"},
+                content=http_error("Invalid bearer token."),
+            )
+    return None
+
+
+def check_model_id(
+    model_id: str, pipeline_model_id: str
+) -> JSONResponse | None:
+    """Validate that the requested model_id matches the pipeline's model_id.
+
+    Returns a 400 JSONResponse if mismatched, or None if valid.
+    """
+    if model_id != "" and model_id != pipeline_model_id:
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content=http_error(
+                f"pipeline configured with {pipeline_model_id} but called with "
+                f"{model_id}."
+            ),
+        )
+    return None
+
+
+def execute_pipeline(
+    pipeline: Callable,
+    default_error_message: str = "Pipeline error.",
+    custom_error_config: Dict[str, Tuple[str | None, int]] | None = None,
+    **kwargs,
+) -> tuple[any, None] | tuple[None, JSONResponse]:
+    """Execute a pipeline call with standardized error handling.
+
+    Handles CUDA OOM cleanup and error response formatting.
+
+    Returns:
+        (result, None) on success, or (None, JSONResponse) on error.
+    """
+    try:
+        result = pipeline(**kwargs)
+        return result, None
+    except Exception as e:
+        if isinstance(e, torch.cuda.OutOfMemoryError):
+            torch.cuda.empty_cache()
+        logger.error(f"Pipeline error: {e}")
+        return None, handle_pipeline_exception(
+            e,
+            default_error_message=default_error_message,
+            custom_error_config=custom_error_config,
+        )

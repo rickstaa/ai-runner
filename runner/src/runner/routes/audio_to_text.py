@@ -1,8 +1,6 @@
 import logging
-import os
 from typing import Annotated, Dict, Tuple, Union
 
-import torch
 from fastapi import APIRouter, Depends, File, Form, UploadFile, status
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -12,9 +10,12 @@ from runner.pipelines.base import Pipeline
 from runner.routes.utils import (
     HTTPError,
     TextResponse,
+    RESPONSES,
+    check_auth_token,
+    check_model_id,
+    execute_pipeline,
     file_exceeds_max_size,
     get_media_duration_ffmpeg,
-    handle_pipeline_exception,
     http_error,
     parse_key_from_metadata,
 )
@@ -37,21 +38,11 @@ PIPELINE_ERROR_CONFIG: Dict[str, Tuple[Union[str, None], int]] = {
     ),
 }
 
-RESPONSES = {
-    status.HTTP_200_OK: {
-        "content": {
-            "application/json": {
-                "schema": {
-                    "x-speakeasy-name-override": "data",
-                }
-            }
-        },
-    },
-    status.HTTP_400_BAD_REQUEST: {"model": HTTPError},
-    status.HTTP_401_UNAUTHORIZED: {"model": HTTPError},
+# Extend shared RESPONSES with additional status codes for this route.
+AUDIO_RESPONSES = {
+    **RESPONSES,
     status.HTTP_413_REQUEST_ENTITY_TOO_LARGE: {"model": HTTPError},
     status.HTTP_415_UNSUPPORTED_MEDIA_TYPE: {"model": HTTPError},
-    status.HTTP_500_INTERNAL_SERVER_ERROR: {"model": HTTPError},
 }
 
 
@@ -76,7 +67,7 @@ def parse_return_timestamps(value: str) -> Union[bool, str]:
 @router.post(
     "/audio-to-text",
     response_model=TextResponse,
-    responses=RESPONSES,
+    responses=AUDIO_RESPONSES,
     description="Transcribe audio files to text.",
     operation_id="genAudioToText",
     summary="Audio To Text",
@@ -86,7 +77,7 @@ def parse_return_timestamps(value: str) -> Union[bool, str]:
 @router.post(
     "/audio-to-text/",
     response_model=TextResponse,
-    responses=RESPONSES,
+    responses=AUDIO_RESPONSES,
     include_in_schema=False,
 )
 def audio_to_text(
@@ -116,23 +107,12 @@ def audio_to_text(
     token: HTTPAuthorizationCredentials = Depends(HTTPBearer(auto_error=False)),
 ):
     return_timestamps = parse_return_timestamps(return_timestamps)
-    auth_token = os.environ.get("AUTH_TOKEN")
-    if auth_token:
-        if not token or token.credentials != auth_token:
-            return JSONResponse(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                headers={"WWW-Authenticate": "Bearer"},
-                content=http_error("Invalid bearer token."),
-            )
 
-    if model_id != "" and model_id != pipeline.model_id:
-        return JSONResponse(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            content=http_error(
-                f"pipeline configured with {pipeline.model_id} but called with "
-                f"{model_id}."
-            ),
-        )
+    if auth_error := check_auth_token(token):
+        return auth_error
+
+    if model_error := check_model_id(model_id, pipeline.model_id):
+        return model_error
 
     if file_exceeds_max_size(audio, 50 * 1024 * 1024):
         return JSONResponse(
@@ -154,17 +134,14 @@ def audio_to_text(
             content=http_error("Unable to calculate duration of file"),
         )
 
-    try:
-        return pipeline(
-            audio=audio, return_timestamps=return_timestamps, duration=duration
-        )
-    except Exception as e:
-        if isinstance(e, torch.cuda.OutOfMemoryError):
-            # TODO: Investigate why not all VRAM memory is cleared.
-            torch.cuda.empty_cache()
-        logger.error(f"AudioToText pipeline error: {e}")
-        return handle_pipeline_exception(
-            e,
-            default_error_message="Audio-to-text pipeline error.",
-            custom_error_config=PIPELINE_ERROR_CONFIG,
-        )
+    result, error = execute_pipeline(
+        pipeline,
+        default_error_message="Audio-to-text pipeline error.",
+        custom_error_config=PIPELINE_ERROR_CONFIG,
+        audio=audio,
+        return_timestamps=return_timestamps,
+        duration=duration,
+    )
+    if error:
+        return error
+    return result

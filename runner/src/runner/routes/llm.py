@@ -1,28 +1,33 @@
+import json
 import logging
 import os
 from typing import Union
+
 from fastapi import APIRouter, Depends, status
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+
 from runner.dependencies import get_pipeline
 from runner.pipelines.base import Pipeline
-from runner.routes.utils import HTTPError, LLMRequest, LLMChoice, LLMMessage, LLMResponse, http_error
-import json
+from runner.routes.utils import (
+    HTTPError,
+    LLMChoice,
+    LLMMessage,
+    LLMRequest,
+    LLMResponse,
+    RESPONSES,
+    check_auth_token,
+    check_model_id,
+    http_error,
+)
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
-RESPONSES = {
-    status.HTTP_200_OK: {"model": LLMResponse},
-    status.HTTP_400_BAD_REQUEST: {"model": HTTPError},
-    status.HTTP_401_UNAUTHORIZED: {"model": HTTPError},
-    status.HTTP_500_INTERNAL_SERVER_ERROR: {"model": HTTPError},
-}
 
 @router.post(
     "/llm",
-    response_model=LLMResponse
-,
+    response_model=LLMResponse,
     responses=RESPONSES,
     operation_id="genLLM",
     description="Generate text using a language model.",
@@ -30,29 +35,17 @@ RESPONSES = {
     tags=["generate"],
     openapi_extra={"x-speakeasy-name-override": "llm"},
 )
-@router.post("/llm/", response_model=LLMResponse
-, responses=RESPONSES, include_in_schema=False)
+@router.post("/llm/", response_model=LLMResponse, responses=RESPONSES, include_in_schema=False)
 async def llm(
     request: LLMRequest,
     pipeline: Pipeline = Depends(get_pipeline),
     token: HTTPAuthorizationCredentials = Depends(HTTPBearer(auto_error=False)),
 ) -> Union[LLMResponse, JSONResponse, StreamingResponse]:
-    auth_token = os.environ.get("AUTH_TOKEN")
-    if auth_token:
-        if not token or token.credentials != auth_token:
-            return JSONResponse(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                headers={"WWW-Authenticate": "Bearer"},
-                content=http_error("Invalid bearer token"),
-            )
+    if auth_error := check_auth_token(token):
+        return auth_error
 
-    if request.model != "" and request.model != pipeline.model_id:
-        return JSONResponse(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            content=http_error(
-                f"pipeline configured with {pipeline.model_id} but called with {request.model}"
-            ),
-        )
+    if model_error := check_model_id(request.model, pipeline.model_id):
+        return model_error
 
     try:
         generator = pipeline(
