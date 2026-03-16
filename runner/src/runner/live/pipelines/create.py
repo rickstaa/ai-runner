@@ -1,4 +1,13 @@
-"""@pipeline decorator for creating live pipelines."""
+"""@pipeline decorator for creating live pipelines.
+
+Lifecycle hooks:
+
+* ``prepare_models``: called at build time (model download, TensorRT compile)
+* ``on_ready``: called once at startup
+* ``transform``: called per frame
+* ``on_update``: called when params change mid-stream
+* ``on_stop``: called on shutdown
+"""
 
 import asyncio
 import logging
@@ -21,7 +30,7 @@ def pipeline(
     params: Optional[Type[BaseParams]] = None,
     initial_params: Optional[dict] = None,
 ):
-    """Decorator to define a live pipeline. Can decorate a function or class.
+    """Decorator to define a pipeline. Can decorate a function or class.
 
     Args:
         name: Pipeline identifier. Must match the MODEL_ID on the orchestrator.
@@ -32,12 +41,15 @@ def pipeline(
 
     def decorator(func_or_class):
         if callable(func_or_class) and not isinstance(func_or_class, type):
-            # Function form: wrap into a minimal class with just transform.
+            # Function form: wrap into a minimal class with a transform method.
             func = func_or_class
+
             class _Wrapper:
                 async def transform(self, frame, p):
                     return await _invoke(func, frame, p)
+
             _Wrapper.__name__ = func.__name__
+            _Wrapper.__qualname__ = func.__qualname__
             _Wrapper.__module__ = func.__module__
             user_cls = _Wrapper
         elif isinstance(func_or_class, type):
@@ -67,7 +79,12 @@ def pipeline(
 
 
 def _build_pipeline(user_cls, params_cls: Type[BaseParams]) -> Type[Pipeline]:
-    """Build a Pipeline subclass from a user class."""
+    """Build a Pipeline subclass from a user class.
+
+    The user class must define a ``transform`` method. Lifecycle hooks are
+    detected by name: ``on_ready``, ``on_update``, ``on_stop``,
+    ``prepare_models``.
+    """
     if not hasattr(user_cls, "transform"):
         raise TypeError(
             f"@pipeline class {user_cls.__name__} must define a 'transform' method"
@@ -97,8 +114,13 @@ def _build_pipeline(user_cls, params_cls: Type[BaseParams]) -> Type[Pipeline]:
 
         async def put_video_frame(self, frame: VideoFrame, request_id: str):
             async with self._lock:
-                result = await _invoke(self._inner.transform, frame, self.params_instance)
+                result = await _invoke(
+                    self._inner.transform, frame, self.params_instance
+                )
             if isinstance(result, VideoOutput):
+                # Normalize request_id to match the current stream.
+                if result.request_id != request_id:
+                    result = VideoOutput(result.frame, request_id)
                 await self.frame_queue.put(result)
             else:
                 await self.frame_queue.put(
@@ -121,14 +143,18 @@ def _build_pipeline(user_cls, params_cls: Type[BaseParams]) -> Type[Pipeline]:
                 await _invoke(self._inner.on_stop)
 
         @classmethod
-        def prepare_models(cls):
+        async def prepare_models(cls):
             if has_prepare:
-                user_cls.prepare_models()
+                await _invoke(user_cls.prepare_models)
             else:
-                logging.info(f"{label} pipeline does not require model preparation")
+                logging.info(
+                    f"{label} pipeline does not require model preparation"
+                )
 
-    GeneratedPipeline.__name__ = f"{label}Pipeline"
-    GeneratedPipeline.__qualname__ = f"{label}Pipeline"
+    # Keep the original decorated name so importlib can find it via
+    # getattr(module, name) after the decorator replaces the symbol.
+    GeneratedPipeline.__name__ = user_cls.__name__
+    GeneratedPipeline.__qualname__ = user_cls.__qualname__
     GeneratedPipeline.__module__ = user_cls.__module__
 
     return GeneratedPipeline

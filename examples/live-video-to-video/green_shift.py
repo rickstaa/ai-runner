@@ -1,11 +1,11 @@
 """Green Shift -- minimal @pipeline example (function form).
 
 Boosts the green channel of every video frame. No model download, no GPU
-inference -- just a tensor op. Ideal for verifying the pipeline infrastructure.
+inference — just a tensor op. Ideal for verifying the pipeline infrastructure.
 
 Usage:
     python -m runner.live.infer \
-        --pipeline '{"pipeline_cls":"examples.pipelines.green_shift:GreenShiftPipeline"}'
+        --pipeline '{"pipeline_cls":"examples.live_video_to_video.green_shift:green_shift"}'
 """
 
 import torch
@@ -24,6 +24,3 @@ async def green_shift(frame: VideoFrame, params: BaseParams) -> torch.Tensor:
     tensor = frame.tensor.clone()
     tensor[:, :, :, 1] = torch.clamp(tensor[:, :, :, 1] + 0.3, -1.0, 1.0)
     return tensor
-
-
-GreenShiftPipeline = green_shift

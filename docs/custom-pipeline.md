@@ -1,4 +1,4 @@
-# Creating a Custom Live Pipeline
+# Creating a Custom Pipeline
 
 This guide explains how to create a custom pipeline for the AI Runner from a **separate repository**. We'll use [scope-runner](https://github.com/livepeer/scope-runner) as a reference implementation.
 
@@ -9,7 +9,7 @@ This guide explains how to create a custom pipeline for the AI Runner from a **s
 A custom pipeline is a Python package that:
 
 1. Extends the `ai-runner[realtime]` library as a dependency (or `ai-runner[batch]` for a batch pipeline)
-2. Implements the [`Pipeline`](../runner/src/runner/live/pipelines/interface.py#L46) interface for frame processing
+2. Uses the [`@pipeline`](../runner/src/runner/live/pipelines/create.py) decorator to define frame processing logic
 3. Optionally defines custom parameters extending [`BaseParams`](../runner/src/runner/live/pipelines/interface.py#L10)
 4. Provides a `prepare_models()` classmethod for model download/compilation
 5. Ships as a Docker image, ideally extending `livepeer/ai-runner:live-base`
@@ -76,11 +76,7 @@ touch src/my_pipeline/pipeline/params.py
 
 ## Step 2: Implement the Pipeline
 
-You have two options: the `@pipeline` decorator (recommended) or the raw `Pipeline` interface (full control over frame queuing, batching, and threading).
-
-### Option A: `@pipeline` Decorator (Recommended)
-
-The `@pipeline` decorator handles frame queues, lifecycle, threading, and parameter validation automatically.
+Use the `@pipeline` decorator to define your pipeline. The decorator handles frame queues, lifecycle management, parameter validation, and threading automatically.
 
 **Function form** — simplest possible pipeline:
 
@@ -96,143 +92,68 @@ async def green_shift(frame: VideoFrame, params: BaseParams) -> torch.Tensor:
     tensor = frame.tensor.clone()
     tensor[:, :, :, 1] = torch.clamp(tensor[:, :, :, 1] + 0.3, -1.0, 1.0)
     return tensor
-
-GreenShiftPipeline = green_shift
 ```
 
-**Class form** — for model loading, state, and mid-stream parameter updates:
+**Class form** — for state, device setup, and mid-stream parameter updates:
 
 ```python
 # src/my_pipeline/pipeline/pipeline.py
 import logging
 import torch
+import torch.nn.functional as F
 from pydantic import Field
 from runner.live.pipelines import pipeline, BaseParams
 from runner.live.trickle import VideoFrame
 
-class DepthParams(BaseParams):
-    colormap: bool = Field(default=True, description="Apply colormap to depth output.")
-    near_clip: float = Field(default=0.0, ge=0.0, le=1.0)
-    far_clip: float = Field(default=1.0, ge=0.0, le=1.0)
+class EdgeParams(BaseParams):
+    threshold: float = Field(default=0.1, ge=0.0, le=1.0, description="Edge threshold.")
+    colorize: bool = Field(default=False, description="Colorize edges by direction.")
 
-@pipeline(name="depth-midas", params=DepthParams)
-class DepthMidas:
+@pipeline(name="edge-detect", params=EdgeParams)
+class EdgeDetect:
 
     def on_ready(self, **params):
-        # Load model and set up device
+        self._threshold = params.get("threshold", 0.1)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model = torch.hub.load("intel-isl/MiDaS", "MiDaS_small", pretrained=True)
-        self.model.to(self.device).eval()
-        self.transforms = torch.hub.load("intel-isl/MiDaS", "transforms").small_transform
+        self.sobel_x = torch.tensor(
+            [[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32, device=self.device
+        ).view(1, 1, 3, 3)
+        self.sobel_y = torch.tensor(
+            [[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32, device=self.device
+        ).view(1, 1, 3, 3)
 
-    def transform(self, frame: VideoFrame, params: DepthParams) -> torch.Tensor:
-        # Run inference and return output tensor
-        tensor = frame.tensor[0]
-        h, w = tensor.shape[:2]
-        img = ((tensor + 1.0) / 2.0 * 255).byte().cpu().numpy()
-        input_batch = self.transforms(img).to(self.device)
-        with torch.no_grad():
-            depth = self.model(input_batch)
-        depth = torch.nn.functional.interpolate(
-            depth.unsqueeze(1), size=(h, w), mode="bilinear", align_corners=False
-        ).squeeze()
-        depth = (depth - depth.min()) / (depth.max() - depth.min() + 1e-8)
-        out = depth.unsqueeze(-1).expand(-1, -1, 3)
-        return (out * 2.0 - 1.0).unsqueeze(0).to(frame.tensor.device)
+    def transform(self, frame: VideoFrame, params: EdgeParams) -> torch.Tensor:
+        tensor = frame.tensor.to(self.device)
+        gray = tensor.mean(dim=-1, keepdim=True).permute(0, 3, 1, 2)
+        edges_x = F.conv2d(gray, self.sobel_x, padding=1)
+        edges_y = F.conv2d(gray, self.sobel_y, padding=1)
+        magnitude = torch.sqrt(edges_x ** 2 + edges_y ** 2)
+        magnitude = magnitude / (magnitude.max() + 1e-8)
+        edges = (magnitude > self._threshold).float()
+        out = edges.expand(-1, 3, -1, -1).permute(0, 2, 3, 1)
+        return (out * 2.0 - 1.0)
 
     def on_update(self, **params):
-        # Handle mid-stream parameter changes
-        logging.info(f"Params updated: {params}")
+        self._threshold = params.get("threshold", 0.1)
+        logging.info(f"Edge threshold updated: {self._threshold}")
 
     def on_stop(self):
-        logging.info("DepthMidas stopped")
-
-    @classmethod
-    def prepare_models(cls):
-        # Download model weights at build time
-        torch.hub.load("intel-isl/MiDaS", "MiDaS_small", pretrained=True)
-
-DepthMidasPipeline = DepthMidas
+        logging.info("EdgeDetect stopped")
 ```
 
-**Decorator class methods:**
+**Lifecycle methods:**
 
-| Method | Required | When it runs |
-|---|---|---|
-| `transform(self, frame, params)` | Yes | Every frame |
-| `on_ready(self, **params)` | No | Once on startup |
-| `on_update(self, **params)` | No | When params change mid-stream |
-| `on_stop(self)` | No | On shutdown |
-| `prepare_models(cls)` | No | At build time (model download) |
+| Method | Required | When it runs | What to do here |
+|---|---|---|---|
+| `prepare_models(cls)` | No | **Build time** | Download weights, compile TensorRT engines |
+| `on_ready(self, **params)` | No | **Process startup** | Load model from disk to GPU |
+| `transform(self, frame, params)` | Yes | **Every frame** | Run inference, return tensor |
+| `on_update(self, **params)` | No | **Mid-stream** | Handle param changes |
+| `on_stop(self)` | No | **Shutdown** | Release resources |
 
-Both `async def` and `def` work. Sync functions automatically run in a thread pool.
+Both `async def` and `def` work for all methods. Sync functions automatically run in a thread pool.
 
-See [`examples/pipelines/`](../examples/pipelines/) for complete working examples.
-
-### Option B: Raw `Pipeline` Interface
-
-For advanced use cases where you need full control over frame queuing, custom batching, or complex threading. Here's the same depth-midas pipeline implemented with the raw interface:
-
-```python
-# src/my_pipeline/pipeline/pipeline.py
-import asyncio
-import logging
-import torch
-from runner.live.pipelines import Pipeline
-from runner.live.trickle import VideoFrame, VideoOutput
-
-class DepthMidasPipeline(Pipeline):
-    def __init__(self):
-        self.frame_queue: asyncio.Queue[VideoOutput] = asyncio.Queue()
-
-    async def initialize(self, **params):
-        # Load model (use asyncio.to_thread for blocking operations)
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model = await asyncio.to_thread(
-            torch.hub.load, "intel-isl/MiDaS", "MiDaS_small", pretrained=True
-        )
-        self.model.to(self.device).eval()
-        self.transforms = torch.hub.load("intel-isl/MiDaS", "transforms").small_transform
-
-    async def put_video_frame(self, frame: VideoFrame, request_id: str):
-        # Run inference in thread pool to avoid blocking the event loop
-        result = await asyncio.to_thread(self._run_inference, frame)
-        await self.frame_queue.put(
-            VideoOutput(frame, request_id).replace_tensor(result)
-        )
-
-    def _run_inference(self, frame: VideoFrame) -> torch.Tensor:
-        tensor = frame.tensor[0]
-        h, w = tensor.shape[:2]
-        img = ((tensor + 1.0) / 2.0 * 255).byte().cpu().numpy()
-        input_batch = self.transforms(img).to(self.device)
-        with torch.no_grad():
-            depth = self.model(input_batch)
-        depth = torch.nn.functional.interpolate(
-            depth.unsqueeze(1), size=(h, w), mode="bilinear", align_corners=False
-        ).squeeze()
-        depth = (depth - depth.min()) / (depth.max() - depth.min() + 1e-8)
-        out = depth.unsqueeze(-1).expand(-1, -1, 3)
-        return (out * 2.0 - 1.0).unsqueeze(0).to(frame.tensor.device)
-
-    async def get_processed_video_frame(self) -> VideoOutput:
-        return await self.frame_queue.get()
-
-    async def update_params(self, **params):
-        # Handle mid-stream parameter changes
-        # Return asyncio.create_task(...) for slow reloads (shows loading overlay)
-        logging.info(f"Updating params: {params}")
-
-    async def stop(self):
-        logging.info("Stopping pipeline")
-
-    @classmethod
-    def prepare_models(cls):
-        # Download model weights at build time
-        torch.hub.load("intel-isl/MiDaS", "MiDaS_small", pretrained=True)
-```
-
-For another real-world example, see [scope-runner's pipeline](https://github.com/daydreamlive/scope-runner/blob/dec9ecf7e306892df9cfae21759c23fdf15b0510/src/scope_runner/pipeline/pipeline.py#L22).
+See [`examples/live-video-to-video/`](../examples/live-video-to-video/) for complete working examples.
 
 ### Define Parameters (Optional)
 
@@ -321,9 +242,16 @@ CMD ["uv", "run", "--frozen", "my-pipeline"]
 
 ## Step 5: Implement Model Preparation
 
-The `prepare_models()` classmethod is called when running with the `PREPARE_MODELS=1` environment variable (or `--prepare-models` flag). It is set automatically by `dl_checkpoints.sh` during operator setup.
+The `prepare_models()` classmethod runs at **build time** when an operator sets up their node, not when a stream or request arrives. It is triggered by the `PREPARE_MODELS=1` environment variable (or `--prepare-models` flag), and is called automatically by `dl_checkpoints.sh` during operator setup.
 
-Example implementation (in your `pipeline.py`):
+This is the right place for any expensive one-time work:
+
+- **Downloading model weights** from HuggingFace, Google Drive, etc.
+- **Compiling TensorRT engines** for optimized GPU inference
+- **Converting model formats** (e.g., ONNX export, quantization)
+- **Warming up caches** or generating lookup tables
+
+Unlike runtime (where `HF_HUB_OFFLINE=1` prevents accidental downloads), `prepare_models` runs with full network access so you can fetch weights from HuggingFace, Google Drive, or other sources.
 
 ```python
 @classmethod
@@ -344,10 +272,24 @@ def prepare_models(cls):
         local_dir_use_symlinks=False,
     )
 
-    # Compile TensorRT engines if needed
-    # This is where you'd run expensive one-time operations
+    # Optional: compile TensorRT engine for faster inference
+    # import torch_tensorrt
+    # model = torch.load(models_dir / "my-model" / "model.pt")
+    # trt_model = torch_tensorrt.compile(model, inputs=[...])
+    # torch.save(trt_model, models_dir / "my-model" / "model_trt.pt")
 
     logging.info("Model preparation complete")
+```
+
+Then in `on_ready`, just load the pre-downloaded (and optionally pre-compiled) model from disk:
+
+```python
+def on_ready(self, **params):
+    """Load model from disk to GPU. Should be fast (seconds, not minutes)."""
+    models_dir = Path(os.environ.get("MODEL_DIR", "/models")) / "MyPipeline--models"
+    self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    self.model = torch.load(models_dir / "my-model" / "model.pt", map_location=self.device)
+    self.model.eval()
 ```
 
 ---
@@ -492,8 +434,7 @@ The orchestrator will route requests to your local runner at `http://localhost:8
 
 ### Async Operations
 
-- Use `asyncio.to_thread()` for blocking/CPU-bound operations
-- Never block the event loop in `put_video_frame` or `get_processed_video_frame`
+- Both `async def` and `def` work — the `@pipeline` decorator automatically runs sync methods in a thread pool so they won't block the event loop
 
 ### Error Handling
 
@@ -502,8 +443,8 @@ The orchestrator will route requests to your local runner at `http://localhost:8
 
 ### Parameter Updates
 
-- Return nothing from `update_params()` for instant updates
-- Return an `asyncio.Task` for updates that will take a long time, normally a "pipeline reload". The runtime shows loading overlay while the reload is running.
+- Return nothing from `on_update()` for instant updates
+- For slow reloads, the runtime shows a loading overlay while the update is running
 
 ---
 
@@ -516,19 +457,6 @@ The orchestrator will route requests to your local runner at `http://localhost:8
 2. **Models not found at runtime**: Check that `HF_HUB_OFFLINE=1` is set and models were prepared on the right path (`/models` when running in docker).
 
 3. **CUDA out of memory**: The pipeline runs in an isolated subprocess - OOM errors will trigger a restart.
-
----
-
-## Publishing to the Marketplace
-
-Publish your pipeline to make it discoverable on the marketplace. The CLI extracts the parameter schema from your `@pipeline` decorator and registers it automatically.
-
-```bash
-livepeer publish examples/pipelines/depth_midas.py
-livepeer teardown depth-midas
-livepeer list
-livepeer inspect examples/pipelines/depth_midas.py
-```
 
 ---
 
