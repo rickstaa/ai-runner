@@ -4,12 +4,12 @@ Boosts the green channel of every video frame. No model download, no GPU
 inference — just a tensor op. Ideal for verifying the pipeline infrastructure.
 
 Usage:
-    python -m runner.live.infer \
-        --pipeline '{"pipeline_cls":"examples.live_video_to_video.green_shift:green_shift"}'
+    python examples/live-video-to-video/green_shift.py
 """
 
 import torch
 
+from runner.app import start_app
 from runner.live.pipelines import pipeline, BaseParams
 from runner.live.trickle import VideoFrame
 
@@ -24,3 +24,7 @@ async def green_shift(frame: VideoFrame, params: BaseParams) -> torch.Tensor:
     tensor = frame.tensor.clone()
     tensor[:, :, :, 1] = torch.clamp(tensor[:, :, :, 1] + 0.3, -1.0, 1.0)
     return tensor
+
+
+if __name__ == "__main__":
+    start_app(pipeline=green_shift._spec)

@@ -4,10 +4,7 @@ Pure-torch Sobel edge detection. No external model needed.
 Demonstrates on_ready, transform, on_update, and on_stop lifecycle hooks.
 
 Usage:
-    python -m runner.live.infer \
-        --pipeline '{
-            "pipeline_cls": "examples.live_video_to_video.edge_detect:EdgeDetect"
-        }'
+    python examples/live-video-to-video/edge_detect.py
 """
 
 import logging
@@ -16,6 +13,7 @@ import torch
 import torch.nn.functional as F
 from pydantic import Field
 
+from runner.app import start_app
 from runner.live.pipelines import pipeline, BaseParams
 from runner.live.trickle import VideoFrame
 
@@ -100,3 +98,7 @@ class EdgeDetect:
 
     def on_stop(self):
         logging.info("EdgeDetect stopped")
+
+
+if __name__ == "__main__":
+    start_app(pipeline=EdgeDetect._spec)
