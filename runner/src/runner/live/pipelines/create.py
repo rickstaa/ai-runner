@@ -1,7 +1,6 @@
 """@pipeline decorator for creating live pipelines.
 
 Lifecycle hooks:
-
 * ``prepare_models``: called at build time (model download, TensorRT compile)
 * ``on_ready``: called once at startup
 * ``transform``: called per frame
@@ -10,6 +9,7 @@ Lifecycle hooks:
 """
 
 import asyncio
+import inspect
 import logging
 from typing import Optional, Type
 
@@ -20,7 +20,7 @@ from ..trickle import VideoFrame, VideoOutput
 
 async def _invoke(func, *args, **kwargs):
     """Call a function, handling both async and sync. Sync runs in a thread pool."""
-    if asyncio.iscoroutinefunction(func):
+    if inspect.iscoroutinefunction(func):
         return await func(*args, **kwargs)
     return await asyncio.to_thread(func, *args, **kwargs)
 
@@ -56,7 +56,14 @@ def pipeline(
             user_cls = func_or_class
         else:
             raise TypeError(
-                f"@pipeline can only decorate a function or class, got {type(func_or_class)}"
+                "@pipeline can only decorate a function or class, got "
+                f"{type(func_or_class)}"
+            )
+
+        if "." in user_cls.__qualname__:
+            logging.warning(
+                f"@pipeline decorating nested '{user_cls.__qualname__}' — "
+                f"this may cause import issues if the enclosing scope is not accessible"
             )
 
         pipeline_cls = _build_pipeline(user_cls, params_cls)
@@ -73,6 +80,7 @@ def pipeline(
             params_cls=params_import,
             initial_params=initial_params or {},
         )
+
         return pipeline_cls
 
     return decorator
@@ -147,9 +155,7 @@ def _build_pipeline(user_cls, params_cls: Type[BaseParams]) -> Type[Pipeline]:
             if has_prepare:
                 await _invoke(user_cls.prepare_models)
             else:
-                logging.info(
-                    f"{label} pipeline does not require model preparation"
-                )
+                logging.info(f"{label} pipeline does not require model preparation")
 
     # Keep the original decorated name so importlib can find it via
     # getattr(module, name) after the decorator replaces the symbol.
