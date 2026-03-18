@@ -14,7 +14,7 @@ A custom pipeline is a Python package that:
 4. Provides a `prepare_models()` classmethod for model download/compilation
 5. Ships as a Docker image, ideally extending `livepeer/ai-runner:live-base`
 
-## Prerequisites
+## Requirements
 
 - Python 3.10+ (stricter dependency will likely come from your pipeline code)
 - [uv](https://docs.astral.sh/uv/) package manager
@@ -144,7 +144,7 @@ class EdgeDetect:
 **Lifecycle methods:**
 
 | Method | Required | When it runs | What to do here |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `prepare_models(cls)` | No | **Build time** | Download weights, compile TensorRT engines |
 | `on_ready(self, **params)` | No | **Process startup** | Load model from disk to GPU |
 | `transform(self, frame, params)` | Yes | **Every frame** | Run inference, return tensor |
@@ -378,49 +378,78 @@ When running the orchestrator, configure it to advertise your pipeline capabilit
 
 ### Integration Testing with go-livepeer Box
 
-For full end-to-end testing with the Livepeer stack (gateway, orchestrator, Trickle streams), use the [go-livepeer box](https://github.com/livepeer/go-livepeer/blob/master/box/box.md) with your local runner.
+For full end-to-end testing with the Livepeer stack (gateway, orchestrator, MediaMTX, Trickle streams), use the [go-livepeer box](https://github.com/livepeer/go-livepeer/blob/master/box/box.md) with your local runner. You will need [go-livepeer](https://github.com/livepeer/go-livepeer) cloned and [MediaMTX](https://github.com/bluenviron/mediamtx) — either installed locally or via Docker (`DOCKER=true`).
 
-1. **Start your local pipeline**:
+#### 1. Start your local pipeline
 
-   ```bash
-   uv run my-pipeline
-   # Pipeline starts on http://localhost:8000
-   ```
+```bash
+# From your pipeline project (or the ai-runner examples)
+cd ai-runner/runner
+uv sync --extra realtime-dev
+PYTHONPATH=src:../examples/live-video-to-video uv run python \
+    ../examples/live-video-to-video/test_examples.py green-shift
 
-2. **Create an `aiModels.json` file** pointing to your local runner:
+# Pipeline starts on http://localhost:8000
+```
 
-   ```json
-   [
-     {
-       "pipeline": "live-video-to-video",
-       "model_id": "my-pipeline",
-       "url": "http://localhost:8000"
-     }
-   ]
-   ```
+#### 2. Create an `aiModels.json` file
 
-   The `url` field tells the orchestrator to use your local runner instead of starting a Docker container. The `model_id` must match your pipeline's `name` in the `PipelineSpec`.
+Create `go-livepeer/box/aiModels.json` pointing to your local runner:
 
-3. **Start the go-livepeer box** with your config:
+```json
+[
+  {
+    "pipeline": "live-video-to-video",
+    "model_id": "my-pipeline",
+    "url": "http://localhost:8000"
+  }
+]
+```
 
-   ```bash
-   cd /path/to/go-livepeer/box
+The `url` field tells the orchestrator to use your local runner as an "external container" instead of starting a Docker container. The `model_id` must match your pipeline's `name` in the `PipelineSpec`.
 
-   # Point to your aiModels.json file
-   export AI_MODELS_JSON=/path/to/aiModels.json
+#### 3. Start the go-livepeer box
 
-   # Start the orchestrator and gateway
-   make box
-   ```
+```bash
+cd go-livepeer
 
-4. **Stream and playback**:
+make box REBUILD=false DOCKER=true \
+    AI_MODELS_JSON="$(pwd)/box/aiModels.json"
+```
 
-   ```bash
-   make box-stream    # Start streaming
-   make box-playback  # View the output
-   ```
+Key flags:
 
-The orchestrator will route requests to your local runner at `http://localhost:8000` instead of spinning up a Docker container.
+| Flag | Purpose |
+| ------ | --------- |
+| `REBUILD=false` | Skips rebuilding go-livepeer and runner (must have been built at least once) |
+| `DOCKER=true` | Runs gateway, orchestrator, and MediaMTX in Docker containers |
+| `AI_MODELS_JSON` | **Must be an absolute path** — the file is mounted into the orchestrator container |
+
+Verify the orchestrator started correctly by looking for these log lines:
+
+```bash
+Starting external container name=live-video-to-video_my-pipeline_http://localhost:8000 modelID=my-pipeline
+Capability live-video-to-video (ID: Live video to video) advertised with model constraint my-pipeline
+```
+
+#### 4. Stream and playback
+
+In separate terminals:
+
+```bash
+# Send a test stream (uses ffmpeg test pattern)
+PIPELINE=my-pipeline make box-stream
+
+# Or stream from your webcam
+PIPELINE=my-pipeline INPUT_WEBCAM=/dev/video0 make box-stream
+
+# View the processed output
+make box-playback
+```
+
+`PIPELINE` is needed for `box-stream` so the RTMP URL includes `pipeline=my-pipeline` in the query string. It is not needed for `box-playback` — the output stream is always `my-stream-out`.
+
+To list available webcam devices, run `ls /dev/video*`.
 
 ---
 
@@ -457,6 +486,8 @@ The orchestrator will route requests to your local runner at `http://localhost:8
 2. **Models not found at runtime**: Check that `HF_HUB_OFFLINE=1` is set and models were prepared on the right path (`/models` when running in docker).
 
 3. **CUDA out of memory**: The pipeline runs in an isolated subprocess - OOM errors will trigger a restart.
+
+4. **"Connection refused" on RTMP port 1935**: This usually means MediaMTX isn't running. Check the `make box` output for MediaMTX errors — if you see `[RTMP] listener is closing` shortly after startup, a port conflict likely caused it to shut down (see issue 4 above).
 
 ---
 
@@ -504,7 +535,7 @@ class MyBatchPipeline(Pipeline):
 **Key differences from live pipelines:**
 
 | Aspect | Live Pipeline | Batch Pipeline |
-|--------|---------------|----------------|
+| --- | --- | --- |
 | Base class | `runner.live.pipelines.Pipeline` | `runner.pipelines.base.Pipeline` |
 | Processing | Continuous frame stream | Single request/response |
 | Entry point | `start_app(pipeline_spec)` | `start_app(pipeline_instance)` |

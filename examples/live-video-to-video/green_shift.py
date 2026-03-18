@@ -24,7 +24,3 @@ async def green_shift(frame: VideoFrame, params: BaseParams) -> torch.Tensor:
     tensor = frame.tensor.clone()
     tensor[:, :, :, 1] = torch.clamp(tensor[:, :, :, 1] + 0.3, -1.0, 1.0)
     return tensor
-
-
-if __name__ == "__main__":
-    start_app(pipeline=green_shift._spec)

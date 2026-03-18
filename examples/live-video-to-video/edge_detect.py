@@ -98,7 +98,3 @@ class EdgeDetect:
 
     def on_stop(self):
         logging.info("EdgeDetect stopped")
-
-
-if __name__ == "__main__":
-    start_app(pipeline=EdgeDetect._spec)
