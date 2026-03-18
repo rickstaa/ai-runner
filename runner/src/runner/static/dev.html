@@ -1,0 +1,285 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI Runner - Dev Test</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, monospace; background: #0d1117; color: #c9d1d9; }
+  .header { padding: 16px 24px; border-bottom: 1px solid #21262d; display: flex; align-items: center; gap: 16px; }
+  .header h1 { font-size: 18px; font-weight: 600; }
+  .header .pipeline-name { color: #58a6ff; font-size: 14px; background: #161b22; padding: 4px 12px; border-radius: 6px; border: 1px solid #30363d; }
+  .status { font-size: 12px; padding: 4px 8px; border-radius: 12px; }
+  .status.connected { background: #0d3117; color: #3fb950; }
+  .status.disconnected { background: #3d1117; color: #f85149; }
+  .main { display: flex; gap: 24px; padding: 24px; flex-wrap: wrap; }
+  .panel { flex: 1; min-width: 400px; background: #161b22; border: 1px solid #30363d; border-radius: 8px; overflow: hidden; }
+  .panel-header { padding: 12px 16px; border-bottom: 1px solid #21262d; font-size: 13px; font-weight: 600; display: flex; justify-content: space-between; align-items: center; }
+  .panel-body { padding: 16px; }
+  video { width: 100%; border-radius: 4px; background: #000; }
+  .controls { padding: 16px 24px; border-top: 1px solid #21262d; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+  button { padding: 8px 16px; border-radius: 6px; border: 1px solid #30363d; background: #21262d; color: #c9d1d9; cursor: pointer; font-size: 13px; }
+  button:hover { background: #30363d; }
+  button.primary { background: #238636; border-color: #2ea043; color: #fff; }
+  button.primary:hover { background: #2ea043; }
+  button.danger { background: #da3633; border-color: #f85149; color: #fff; }
+  button.danger:hover { background: #f85149; }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  .stats { font-size: 12px; color: #8b949e; font-family: monospace; }
+  .stats span { margin-right: 16px; }
+  .stats .value { color: #58a6ff; }
+  .log { font-size: 11px; font-family: monospace; background: #0d1117; border: 1px solid #21262d; border-radius: 4px; padding: 8px; max-height: 200px; overflow-y: auto; margin-top: 12px; color: #8b949e; }
+  .log .entry { padding: 2px 0; }
+  .log .error { color: #f85149; }
+  .log .info { color: #3fb950; }
+  select { padding: 6px 10px; border-radius: 6px; border: 1px solid #30363d; background: #21262d; color: #c9d1d9; font-size: 13px; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>AI Runner Dev</h1>
+  <span class="pipeline-name" id="pipelineName">loading...</span>
+  <span class="status disconnected" id="statusBadge">disconnected</span>
+</div>
+
+<div class="main">
+  <div class="panel">
+    <div class="panel-header">
+      <span>Input (Webcam)</span>
+      <span class="stats"><span>FPS: <span class="value" id="inputFps">0</span></span></span>
+    </div>
+    <div class="panel-body">
+      <video id="inputVideo" autoplay muted playsinline></video>
+    </div>
+  </div>
+  <div class="panel">
+    <div class="panel-header">
+      <span>Output (Pipeline)</span>
+      <span class="stats">
+        <span>FPS: <span class="value" id="outputFps">0</span></span>
+        <span>Segments: <span class="value" id="segCount">0</span></span>
+      </span>
+    </div>
+    <div class="panel-body">
+      <video id="outputVideo" autoplay muted playsinline></video>
+    </div>
+  </div>
+</div>
+
+<div class="controls">
+  <button class="primary" id="startBtn">Start</button>
+  <button class="danger" id="stopBtn" disabled>Stop</button>
+  <label>
+    Resolution:
+    <select id="resolution">
+      <option value="512">512x512</option>
+      <option value="640">640x640</option>
+      <option value="768">768x768</option>
+    </select>
+  </label>
+  <label>
+    Segment interval:
+    <select id="segInterval">
+      <option value="2000">2s</option>
+      <option value="3000" selected>3s</option>
+      <option value="5000">5s</option>
+    </select>
+  </label>
+</div>
+
+<div style="padding: 0 24px 24px;">
+  <div class="log" id="log"></div>
+</div>
+
+<script>
+const $ = (s) => document.getElementById(s);
+
+const state = {
+  running: false,
+  stream: null,
+  recorder: null,
+  publishSeq: 0,
+  subscribeSeq: 0,
+  subscribing: false,
+  inputFrames: 0,
+  outputFrames: 0,
+  lastInputCount: 0,
+  lastOutputCount: 0,
+  segmentsReceived: 0,
+};
+
+function log(msg, type = '') {
+  const el = $('log');
+  const entry = document.createElement('div');
+  entry.className = 'entry ' + type;
+  entry.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+  el.appendChild(entry);
+  el.scrollTop = el.scrollHeight;
+}
+
+// Load pipeline info
+fetch('/dev/info').then(r => r.json()).then(info => {
+  $('pipelineName').textContent = info.pipeline;
+  log(`Pipeline: ${info.pipeline}`, 'info');
+  log(`Subscribe: ${info.subscribe_url}`);
+  log(`Publish: ${info.publish_url}`);
+}).catch(e => log('Failed to load pipeline info: ' + e, 'error'));
+
+// FPS counter
+setInterval(() => {
+  const inFps = state.inputFrames - state.lastInputCount;
+  const outFps = state.outputFrames - state.lastOutputCount;
+  state.lastInputCount = state.inputFrames;
+  state.lastOutputCount = state.outputFrames;
+  $('inputFps').textContent = inFps;
+  $('outputFps').textContent = outFps;
+}, 1000);
+
+$('startBtn').addEventListener('click', start);
+$('stopBtn').addEventListener('click', stop);
+
+async function start() {
+  const res = parseInt($('resolution').value);
+
+  try {
+    state.stream = await navigator.mediaDevices.getUserMedia({
+      video: { width: res, height: res, frameRate: 24 },
+      audio: false,
+    });
+  } catch (e) {
+    log('Webcam access denied: ' + e, 'error');
+    return;
+  }
+
+  $('inputVideo').srcObject = state.stream;
+  state.running = true;
+  state.publishSeq = 0;
+  state.subscribeSeq = -2;
+  state.segmentsReceived = 0;
+  $('startBtn').disabled = true;
+  $('stopBtn').disabled = false;
+  $('statusBadge').className = 'status connected';
+  $('statusBadge').textContent = 'streaming';
+
+  startPublishing();
+  startSubscribing();
+  log('Started streaming', 'info');
+}
+
+function stop() {
+  state.running = false;
+  if (state.recorder && state.recorder.state !== 'inactive') {
+    state.recorder.stop();
+  }
+  if (state.stream) {
+    state.stream.getTracks().forEach(t => t.stop());
+    state.stream = null;
+  }
+  $('inputVideo').srcObject = null;
+  $('startBtn').disabled = false;
+  $('stopBtn').disabled = true;
+  $('statusBadge').className = 'status disconnected';
+  $('statusBadge').textContent = 'disconnected';
+  log('Stopped streaming', 'info');
+}
+
+function startPublishing() {
+  // Use MediaRecorder to produce webm segments, then POST to trickle
+  const mimeType = MediaRecorder.isTypeSupported('video/webm;codecs=vp8')
+    ? 'video/webm;codecs=vp8'
+    : 'video/webm';
+
+  state.recorder = new MediaRecorder(state.stream, {
+    mimeType,
+    videoBitsPerSecond: 2_000_000,
+  });
+
+  const interval = parseInt($('segInterval').value);
+
+  state.recorder.ondataavailable = async (e) => {
+    if (e.data.size === 0 || !state.running) return;
+    const seq = state.publishSeq++;
+    state.inputFrames++;
+    try {
+      await fetch(`/trickle/input/${seq}`, {
+        method: 'POST',
+        body: e.data,
+        headers: { 'Content-Type': 'video/mp2t' },
+      });
+    } catch (err) {
+      log(`Publish error seq=${seq}: ${err}`, 'error');
+    }
+  };
+
+  state.recorder.start(interval);
+  log(`MediaRecorder started (${mimeType}, ${interval}ms segments)`);
+}
+
+async function startSubscribing() {
+  if (state.subscribing) return;
+  state.subscribing = true;
+
+  // Use MediaSource to play back received segments
+  const outputVideo = $('outputVideo');
+
+  // For simplicity, accumulate and use blob URLs per segment
+  while (state.running) {
+    const seq = state.subscribeSeq;
+    try {
+      const resp = await fetch(`/trickle/output/${seq}`);
+
+      if (!state.running) break;
+
+      if (resp.status === 470) {
+        // Jump to latest
+        const latest = resp.headers.get('Lp-Trickle-Latest');
+        if (latest) {
+          state.subscribeSeq = parseInt(latest);
+          log(`Jumped to latest segment: ${latest}`);
+        }
+        continue;
+      }
+
+      if (resp.status === 404) {
+        // No data yet, retry after delay
+        await new Promise(r => setTimeout(r, 500));
+        continue;
+      }
+
+      if (resp.ok) {
+        const trickleSeq = resp.headers.get('Lp-Trickle-Seq');
+        const actualSeq = trickleSeq ? parseInt(trickleSeq) : seq;
+        state.subscribeSeq = actualSeq + 1;
+        state.segmentsReceived++;
+        $('segCount').textContent = state.segmentsReceived;
+
+        const blob = await resp.blob();
+        if (blob.size > 0) {
+          const url = URL.createObjectURL(blob);
+          outputVideo.src = url;
+          outputVideo.play().catch(() => {});
+          state.outputFrames++;
+          // Clean up old blob URL after a delay
+          setTimeout(() => URL.revokeObjectURL(url), 10000);
+        }
+
+        const closed = resp.headers.get('Lp-Trickle-Closed');
+        if (closed) {
+          log('Output stream closed', 'info');
+          break;
+        }
+      }
+    } catch (err) {
+      if (!state.running) break;
+      log(`Subscribe error seq=${seq}: ${err}`, 'error');
+      await new Promise(r => setTimeout(r, 1000));
+    }
+  }
+
+  state.subscribing = false;
+}
+</script>
+</body>
+</html>
