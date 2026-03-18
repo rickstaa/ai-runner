@@ -1,31 +1,23 @@
-import asyncio
 import logging
-from pathlib import Path
 
-from .interface import Pipeline
-from ..trickle import VideoFrame, VideoOutput
+from .interface import Pipeline, BaseParams
+from ..trickle import VideoFrame
+
 
 class Noop(Pipeline):
-  def __init__(self):
-    self.frame_queue: asyncio.Queue[VideoOutput] = asyncio.Queue()
+    def transform(self, frame: VideoFrame, params: BaseParams):
+        return frame.tensor.clone()
 
-  async def put_video_frame(self, frame: VideoFrame, request_id: str):
-    await self.frame_queue.put(VideoOutput(frame, request_id))
+    def on_ready(self, **params):
+        logging.info(f"Initializing Noop pipeline with params: {params}")
+        logging.info("Pipeline initialization complete")
 
-  async def get_processed_video_frame(self) -> VideoOutput:
-    out = await self.frame_queue.get()
-    return out.replace_tensor(out.tensor.clone())
+    def on_update(self, **params):
+        logging.info(f"Updating params: {params}")
 
-  async def initialize(self, **params):
-    logging.info(f"Initializing Noop pipeline with params: {params}")
-    logging.info("Pipeline initialization complete")
+    def on_stop(self):
+        logging.info("Stopping pipeline")
 
-  async def update_params(self, **params):
-    logging.info(f"Updating params: {params}")
-
-  async def stop(self):
-    logging.info("Stopping pipeline")
-
-  @classmethod
-  def prepare_models(cls):
-    logging.info("Noop pipeline does not require model preparation")
+    @classmethod
+    def prepare_models(cls):
+        logging.info("Noop pipeline does not require model preparation")

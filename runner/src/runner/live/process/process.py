@@ -1,5 +1,6 @@
 import os
 import asyncio
+import inspect
 import logging
 import hashlib
 import json
@@ -27,6 +28,13 @@ from ..trickle import (
 )
 
 from .loading_overlay import LoadingOverlayRenderer
+
+
+async def _invoke(func, *args, **kwargs):
+    """Call a function, handling both async and sync. Sync runs in a thread pool."""
+    if inspect.iscoroutinefunction(func):
+        return await func(*args, **kwargs)
+    return await asyncio.to_thread(func, *args, **kwargs)
 
 
 class PipelineProcess:
@@ -219,7 +227,7 @@ class PipelineProcess:
                 self._last_params = parse_pipeline_params(self.pipeline_spec, params)
                 self._last_params_request_id = self.request_id
                 pipeline = load_pipeline(self.pipeline_spec)
-                await pipeline.initialize(**params)
+                await _invoke(pipeline.on_ready, **params)
                 return pipeline
         except Exception as e:
             self._report_error("Error loading pipeline", e)
@@ -233,7 +241,7 @@ class PipelineProcess:
                     self._last_params = parse_pipeline_params(self.pipeline_spec, {})
                     self._last_params_request_id = self.request_id
                     pipeline = load_pipeline(self.pipeline_spec)
-                    await pipeline.initialize()
+                    await _invoke(pipeline.on_ready)
                     return pipeline
             except Exception as e:
                 self._report_error("Error loading pipeline with default params", e)
@@ -241,9 +249,10 @@ class PipelineProcess:
 
     async def _run_pipeline_loops(self):
         overlay = LoadingOverlayRenderer()
+        self._pipeline_lock = asyncio.Lock()
+        self._params_instance = self._last_params
         pipeline = await self._initialize_pipeline()
         input_task = asyncio.create_task(self._input_loop(pipeline, overlay))
-        output_task = asyncio.create_task(self._output_loop(pipeline, overlay))
         param_task = asyncio.create_task(self._param_update_loop(pipeline, overlay))
         self._set_pipeline_ready(True)
 
@@ -251,7 +260,7 @@ class PipelineProcess:
             while not self.is_done():
                 await asyncio.sleep(0.1)
 
-        tasks = [input_task, output_task, param_task, asyncio.create_task(wait_for_stop())]
+        tasks = [input_task, param_task, asyncio.create_task(wait_for_stop())]
 
         try:
             await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
@@ -279,7 +288,33 @@ class PipelineProcess:
                     if self._is_loading() and self._last_params.show_reloading_frame:
                         await self._render_loading_frame(overlay, input)
                     else:
-                        await pipeline.put_video_frame(input, self.request_id)
+                        # Call transform under lock and route result to output queue.
+                        async with self._pipeline_lock:
+                            result = await _invoke(
+                                pipeline.transform, input, self._params_instance
+                            )
+
+                        if isinstance(result, VideoOutput):
+                            if result.request_id != self.request_id:
+                                result = VideoOutput(result.frame, self.request_id)
+                            out = result
+                        else:
+                            out = VideoOutput(input, self.request_id).replace_tensor(result)
+
+                        overlay.update_last_frame(out.tensor)
+
+                        if overlay.is_active():
+                            if self._is_loading():
+                                continue
+                            overlay.end_reload()
+
+                        # Move to CPU before sending over multiprocessing queue to avoid CUDA IPC overhead
+                        if out.tensor.is_cuda:
+                            out = out.replace_tensor(out.tensor.cpu())
+
+                        out.log_timestamps["post_process_frame"] = time.time()
+                        self._try_queue_put(self.output_queue, out)
+
                 elif isinstance(input, AudioFrame):
                     self._try_queue_put(self.output_queue, AudioOutput([input], self.request_id))
             except queue.Empty:
@@ -304,27 +339,6 @@ class PipelineProcess:
 
         out.log_timestamps["post_process_frame"] = time.time()
         self._try_queue_put(self.output_queue, out)
-
-    async def _output_loop(self, pipeline: Pipeline, overlay: LoadingOverlayRenderer):
-        while not self.is_done():
-            try:
-                out = await pipeline.get_processed_video_frame()
-                overlay.update_last_frame(out.tensor)
-
-                if overlay.is_active():
-                    if self._is_loading():
-                        # Ignore frames that may come after the loading started to avoid thrashing the loading overlay.
-                        continue
-                    overlay.end_reload()
-
-                # Move to CPU before sending over multiprocessing queue to avoid CUDA IPC overhead
-                if isinstance(out, VideoOutput) and out.tensor.is_cuda:
-                    out = out.replace_tensor(out.tensor.cpu())
-
-                out.log_timestamps["post_process_frame"] = time.time()
-                self._try_queue_put(self.output_queue, out)
-            except Exception as e:
-                self._report_error("Error processing output frame", e)
 
     async def _param_update_loop(self, pipeline: Pipeline, overlay: LoadingOverlayRenderer):
         while not self.is_done():
@@ -353,7 +367,9 @@ class PipelineProcess:
                         )
 
                 with log_timing(f"PipelineProcess: Pipeline update parameters with params_hash={params_hash}"):
-                    reload_task = await pipeline.update_params(**params)
+                    async with self._pipeline_lock:
+                        self._params_instance = new_params
+                        reload_task = await _invoke(pipeline.on_update, **params)
                     self._last_params = new_params
                     self._last_params_request_id = self.request_id
             except Exception as e:
@@ -424,7 +440,7 @@ class PipelineProcess:
         overlay.end_reload()
         if pipeline is not None:
             try:
-                await pipeline.stop()
+                await _invoke(pipeline.on_stop)
             except Exception as e:
                 logging.error(f"Error stopping pipeline: {e}")
 

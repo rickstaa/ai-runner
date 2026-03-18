@@ -14,7 +14,7 @@ import torch.nn.functional as F
 from pydantic import Field
 
 from runner.app import start_app
-from runner.live.pipelines import pipeline, BaseParams
+from runner.live.pipelines import pipeline, Pipeline, BaseParams
 from runner.live.trickle import VideoFrame
 
 
@@ -32,7 +32,7 @@ class EdgeParams(BaseParams):
 
 
 @pipeline(name="edge-detect", params=EdgeParams)
-class EdgeDetect:
+class EdgeDetect(Pipeline):
     """Real-time Sobel edge detection.
 
     Demonstrates:

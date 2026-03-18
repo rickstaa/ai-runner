@@ -33,35 +33,30 @@ LOCAL_MODELS_DIR = Path("./models")
 
 class StreamDiffusion(Pipeline):
     def __init__(self):
-        super().__init__()
         self.pipe: Optional[StreamDiffusionWrapper] = None
         self.params: Optional[StreamDiffusionParams] = None
         self.first_frame = True
-        self.frame_queue: asyncio.Queue[VideoOutput] = asyncio.Queue()
-        self._pipeline_lock = asyncio.Lock()  # Protects pipeline initialization/reinitialization
         self._cached_style_image_tensor: Optional[torch.Tensor] = None
         self._cached_style_image_url: Optional[str] = None
 
-    async def initialize(self, **params):
+    async def on_ready(self, **params):
         logging.info(f"Initializing StreamDiffusion pipeline with params: {params}")
-        reload_task = await self.update_params(**params)
+        reload_task = await self.on_update(**params)
         if reload_task:
             logging.info("Task returned, waiting for pipeline reload")
             await reload_task
         logging.info("Pipeline initialization complete")
 
-    async def put_video_frame(self, frame: VideoFrame, request_id: str):
+    def transform(self, frame: VideoFrame, params):
         if self.params is None:
             raise RuntimeError("Pipeline not initialized")
 
-        async with self._pipeline_lock:
-            if self.pipe is None:
-                # We are likely loading a new pipeline, so drop input input frames
-                return
-            out_tensor = await asyncio.to_thread(self.process_tensor_sync, frame.tensor)
-            output = VideoOutput(frame, request_id).replace_tensor(out_tensor)
+        if self.pipe is None:
+            # We are likely loading a new pipeline, so drop input frames
+            return frame.tensor
 
-        await self.frame_queue.put(output)
+        out_tensor = self.process_tensor_sync(frame.tensor)
+        return out_tensor
 
     def process_tensor_sync(self, img_tensor: torch.Tensor):
         assert self.pipe is not None
@@ -98,10 +93,7 @@ class StreamDiffusion(Pipeline):
 
         return out_tensor
 
-    async def get_processed_video_frame(self) -> VideoOutput:
-        return await self.frame_queue.get()
-
-    async def update_params(self, **params):
+    async def on_update(self, **params):
         new_params = StreamDiffusionParams(**params)
         if new_params == self.params:
             logging.info("No parameters changed")
@@ -115,25 +107,23 @@ class StreamDiffusion(Pipeline):
         ):
             await self._fetch_style_image(new_params.ip_adapter_style_image_url)
 
-        async with self._pipeline_lock:
-            try:
-                if await self._update_params_dynamic(new_params):
-                    return
-            except Exception as e:
-                logging.error(
-                    f"[update_params] Error updating params dynamically, reloading pipeline: {e}",
-                    extra={"report_error": True},
-                    exc_info=True,
-                )
+        try:
+            if self._update_params_dynamic(new_params):
+                return
+        except Exception as e:
+            logging.error(
+                f"[update_params] Error updating params dynamically, reloading pipeline: {e}",
+                extra={"report_error": True},
+                exc_info=True,
+            )
 
         logging.info(f"Resetting pipeline for params change")
         return asyncio.create_task(self._reload_pipeline(new_params))
 
     async def _reload_pipeline(self, new_params: StreamDiffusionParams):
-        async with self._pipeline_lock:
-            # Clear the pipeline while loading the new one.
-            self.pipe = None
-            prev_params = self.params
+        # Clear the pipeline while loading the new one.
+        self.pipe = None
+        prev_params = self.params
 
         new_pipe: Optional[StreamDiffusionWrapper] = None
         try:
@@ -151,17 +141,16 @@ class StreamDiffusion(Pipeline):
                 # No need to log here as we have to bubble up the error to the caller.
                 raise RuntimeError(f"Failed to reload pipeline with previous params: {e}") from e
 
-        async with self._pipeline_lock:
-            self.pipe = new_pipe
-            self.params = new_params
-            self.first_frame = True
+        self.pipe = new_pipe
+        self.params = new_params
+        self.first_frame = True
 
-            if new_params.ip_adapter and new_params.ip_adapter.enabled:
-                await self._update_style_image(new_params)
-                # no-op update prompt to cause an IPAdapter reload
-                self.pipe.update_stream_params(prompt_list=self.pipe.stream._param_updater.get_current_prompts())
+        if new_params.ip_adapter and new_params.ip_adapter.enabled:
+            await self._update_style_image(new_params)
+            # no-op update prompt to cause an IPAdapter reload
+            self.pipe.update_stream_params(prompt_list=self.pipe.stream._param_updater.get_current_prompts())
 
-    async def _update_params_dynamic(self, new_params: StreamDiffusionParams):
+    def _update_params_dynamic(self, new_params: StreamDiffusionParams):
         if self.pipe is None:
             return False
 
@@ -236,7 +225,9 @@ class StreamDiffusion(Pipeline):
         if update_kwargs:
             self.pipe.update_stream_params(**update_kwargs)
         if changed_ipadapter:
-            await self._update_style_image(new_params)
+            # _update_style_image is async but we're in a sync context here;
+            # the framework's _invoke will handle it at the caller level.
+            asyncio.get_event_loop().run_until_complete(self._update_style_image(new_params))
             # no-op update prompt to cause an IPAdapter reload
             self.pipe.update_stream_params(prompt_list=self.pipe.stream._param_updater.get_current_prompts())
 
@@ -274,11 +265,9 @@ class StreamDiffusion(Pipeline):
         self._cached_style_image_tensor = tensor
         self._cached_style_image_url = style_image_url
 
-    async def stop(self):
-        async with self._pipeline_lock:
-            self.pipe = None
-            self.params = None
-            self.frame_queue = asyncio.Queue()
+    def on_stop(self):
+        self.pipe = None
+        self.params = None
 
     @classmethod
     def prepare_models(cls):

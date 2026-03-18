@@ -1,7 +1,7 @@
 from asyncio import Task
 from abc import ABC, abstractmethod
-from pathlib import Path
 
+import torch
 from pydantic import BaseModel, Field
 
 from ..trickle import VideoFrame, VideoOutput, DEFAULT_WIDTH, DEFAULT_HEIGHT
@@ -43,79 +43,83 @@ class BaseParams(BaseModel):
         """
         return (self.width, self.height)
 
+
 class Pipeline(ABC):
-    """Abstract base class for frame processing pipelines.
+    """Base class for all frame processing pipelines.
 
-    .. deprecated::
-        For new pipelines, use the ``@pipeline`` decorator instead of
-        subclassing this ABC directly. The decorator handles frame queues,
-        lifecycle management, and parameter validation automatically.
-        See ``docs/custom-pipeline.md`` for usage.
+    Only ``transform`` is required. All other hooks have sane defaults
+    and can be overridden as needed.
 
-    This ABC is retained for internal use and backward compatibility with
-    existing pipeline implementations (e.g., ComfyUI, StreamDiffusion).
+    Lifecycle:
+        1. ``prepare_models()`` — called at build time (model download, compile)
+        2. ``on_ready(**params)`` — called once at startup with initial params
+        3. ``transform(frame, params)`` — called per frame
+        4. ``on_update(**params)`` — called when params change mid-stream
+        5. ``on_stop()`` — called on shutdown
 
-    Notes:
-    - Error handling is done by the caller, so the implementation can let
-      exceptions propagate for optimal error reporting.
+    The framework manages frame queues, locking, and async/sync dispatch
+    automatically. Pipelines just process frames.
+
+    Example::
+
+        @pipeline(name="my-pipeline", params=MyParams)
+        class MyPipeline(Pipeline):
+            def on_ready(self, **params):
+                self.model = load_model()
+
+            def transform(self, frame: VideoFrame, params: MyParams) -> torch.Tensor:
+                return self.model(frame.tensor)
     """
 
-    def __init__(self):
-        pass
-
     @abstractmethod
-    async def initialize(self, **params):
-        """Initialize the pipeline with parameters and warm up the processing.
-
-        This method sets up the initial pipeline state and performs warmup operations.
-        Must maintain valid state on success or restore previous state on failure.
+    def transform(
+        self, frame: VideoFrame, params: BaseParams
+    ) -> torch.Tensor | VideoOutput:
+        """Process a single video frame. Called for every incoming frame.
 
         Args:
-            **params: Implementation-specific parameters
-        """
-        pass
-
-    @abstractmethod
-    async def put_video_frame(self, frame: VideoFrame, request_id: str):
-        """Put a frame into the pipeline.
-
-        Args:
-            frame: Input VideoFrame
-        """
-        pass
-
-    @abstractmethod
-    async def get_processed_video_frame(self) -> VideoOutput:
-        """Get a processed frame from the pipeline.
+            frame: Input video frame with tensor (B, H, W, C) in [-1.0, 1.0].
+            params: Current pipeline parameters.
 
         Returns:
-            Processed VideoFrame
+            A ``torch.Tensor`` with the same layout as ``frame.tensor``,
+            or a ``VideoOutput`` instance.
         """
-        pass
+        ...
 
-    @abstractmethod
-    async def update_params(self, **params) -> Task[None] | None:
-        """Update pipeline parameters.
+    def on_ready(self, **params) -> None:
+        """Called once after the pipeline is initialized with its first params.
 
-        Must maintain valid state on success or restore previous state on failure.
-        Called sequentially with process_frame so concurrency is not an issue.
-
-        If the update will take a long time (e.g. reloading the pipeline),
-        return a Task that will be awaited by the caller.
+        Use this to allocate models, move tensors to the correct device, etc.
 
         Args:
-            **params: Implementation-specific parameters
+            **params: The initial pipeline parameters as keyword arguments.
         """
-        pass
 
-    async def stop(self):
-        """Stop the pipeline.
+    def on_update(self, **params) -> Task[None] | None:
+        """Called when pipeline parameters change mid-stream.
 
-        Called once when the pipeline is no longer needed.
+        If the update will take a long time (e.g. reloading the pipeline),
+        return a Task that will be awaited by the caller (a loading overlay
+        will be shown in the meantime).
+
+        Args:
+            **params: The updated pipeline parameters as keyword arguments.
+
+        Returns:
+            None for immediate updates, or an asyncio Task for long reloads.
         """
-        pass
+        return None
+
+    def on_stop(self) -> None:
+        """Called once when the pipeline is shutting down.
+
+        Use this to release resources, close files, etc.
+        """
 
     @classmethod
-    def prepare_models(cls):
-        """Download and/or compile any assets required for this pipeline."""
-        pass
+    def prepare_models(cls) -> None:
+        """Download and/or compile any assets required by this pipeline.
+
+        Called at build time (e.g., during Docker image build), not at runtime.
+        """

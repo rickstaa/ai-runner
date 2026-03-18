@@ -1,7 +1,6 @@
 import asyncio
 import logging
 import os
-from pathlib import Path
 
 import torch
 from comfystream.client import ComfyStreamClient
@@ -20,14 +19,14 @@ class ComfyUI(Pipeline):
         comfy_ui_workspace = os.getenv(COMFY_UI_WORKSPACE_ENV)
         self.client = ComfyStreamClient(cwd=comfy_ui_workspace)
         self.params: ComfyUIParams
-        self.video_incoming_frames: asyncio.Queue[VideoOutput] = asyncio.Queue()
 
-    async def initialize(self, **params):
+    def on_ready(self, **params):
         """Initialize the ComfyUI pipeline with given parameters."""
         new_params = ComfyUIParams(**params)
         logging.info(f"Initializing ComfyUI Pipeline with prompt: {new_params.prompt}")
         # TODO: currently its a single prompt, but need to support multiple prompts
-        await self.client.set_prompts([new_params.prompt])
+        # Note: ComfyStreamClient methods are sync, called via _invoke in the framework.
+        self.client.set_prompts_sync([new_params.prompt])
         self.params = new_params
 
         # Warm up the pipeline
@@ -38,28 +37,25 @@ class ComfyUI(Pipeline):
 
         for _ in range(WARMUP_RUNS):
             self.client.put_video_input(dummy_frame)
-            _ = await self.client.get_video_output()
+            _ = self.client.get_video_output_sync()
         logging.info("Pipeline initialization and warmup complete")
 
-    async def put_video_frame(self, frame: VideoFrame, request_id: str):
+    def transform(self, frame: VideoFrame, params: ComfyUIParams):
+        """Process a single frame through ComfyUI."""
         frame.side_data.input = frame.tensor
-        frame.side_data.skipped = True
-        out_frame = VideoOutput(frame.replace_tensor(torch.zeros_like(frame.tensor)), request_id)
-        await self.video_incoming_frames.put(out_frame)
         self.client.put_video_input(frame)
+        result_tensor = self.client.get_video_output_sync()
+        return result_tensor
 
-    async def get_processed_video_frame(self):
-        result_tensor = await self.client.get_video_output()
-        out = await self.video_incoming_frames.get()
-        while out.frame.side_data.skipped:
-            out = await self.video_incoming_frames.get()
-        return out.replace_tensor(result_tensor)
-
-    async def update_params(self, **params):
+    def on_update(self, **params):
         update_task = asyncio.create_task(self._do_update_params(**params))
 
         try:
-            await asyncio.wait_for(asyncio.shield(update_task), timeout=2.0)
+            # If update completes quickly, return None (no reload needed).
+            asyncio.get_event_loop().run_until_complete(
+                asyncio.wait_for(asyncio.shield(update_task), timeout=2.0)
+            )
+            return None
         except asyncio.TimeoutError:
             logging.info("Update taking a while, returning task for loading overlay")
             return update_task
@@ -80,23 +76,16 @@ class ComfyUI(Pipeline):
             raise e
         self.params = new_params
 
-    async def stop(self):
+    def on_stop(self):
         try:
             logging.info("Stopping ComfyUI pipeline")
-            # Wait for the pipeline to stop
-            # Clear the video_incoming_frames queue
-            while not self.video_incoming_frames.empty():
-                try:
-                    self.video_incoming_frames.get_nowait()
-                except asyncio.QueueEmpty:
-                    break
             logging.info("Waiting for ComfyUI client to cleanup")
-            await self.client.cleanup()
-            await asyncio.sleep(1)
+            # Note: cleanup is async on the client; the framework's _invoke handles it.
+            self.client.cleanup_sync()
             logging.info("ComfyUI client cleanup complete")
             # Force CUDA cache clear
             if torch.cuda.is_available():
-                torch.cuda.synchronize()  # Wait for all CUDA operations to complete
+                torch.cuda.synchronize()
                 torch.cuda.empty_cache()
 
         except Exception as e:
